@@ -8,11 +8,11 @@
 工作流编排 (LangGraph)
   ├── 任务规划 Agent      — 科学问题理解、任务拆解、检索策略生成
   ├── 文献检索 Agent       — Sciverse API 语义检索、查询扩展
-  ├── [4a] 检索覆盖度核验  — 证据Agent检验检索覆盖度，不足则回退修正
+  ├── 检索覆盖度核验  — 证据Agent检验检索覆盖度，不足则回退修正
   ├── 文献筛选 Agent       — 去重、Reranker 精排、阈值过滤
   ├── PDF 解析 Agent       — MinerU 全文结构化解析
   ├── 知识抽取 Agent       — LLM 抽取成分/结构/性能/工艺/实验条件
-  ├── [7a] 数据质量核验    — 证据Agent检验单篇抽取合理性，异常分区存储
+  ├── 知识质量核验    — 证据Agent检验单篇抽取合理性，异常分区存储
   ├── 跨文献融合 Agent     — 实体规范化、单位统一、冲突检测
   ├── Gap 识别 Agent      — 缺失检测、矛盾归纳、Gap 生成与评分
   ├── 证据核验 Agent       — 原文回溯、引用验证、事实核查
@@ -30,7 +30,8 @@ cp .env.example .env
 # 编辑 .env，填入 Sciverse API Key、LLM 配置等
 
 # 运行文献调研
-matresearcher survey "硫化物固态电解质室温离子导电率的提升策略"
+cd src
+python -m matresearcher.main survey "你的研究话题"
 
 # 评估
 python scripts/evaluate.py --config config/workflow.yaml
@@ -51,7 +52,7 @@ matresearcher/
 ├── src/matresearcher/
 │   ├── models/          # Pydantic 数据模型
 │   ├── state.py         # 工作流状态定义
-│   ├── agents/          # 8 个角色 Agent
+│   ├── agents/          # 多个Agent角色
 │   ├── tools/           # Sciverse/MinerU/LLM/Embedding/Reranker
 │   ├── knowledge_base/  # 向量库 + 关系库
 │   ├── rules/           # 单位转换/化学式规范化/冲突检测
@@ -61,6 +62,8 @@ matresearcher/
 ├── Dockerfile
 └── docker-compose.yml
 ```
+
+赛题背景：AI for Research 赛道 · 方向三，材料科学文献驱动的科学发现智能体
 
 ## 许可证
 
