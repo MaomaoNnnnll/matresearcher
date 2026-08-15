@@ -1,0 +1,21 @@
+version: "3.9"
+
+services:
+  matresearcher:
+    build: .
+    container_name: matresearcher
+    volumes:
+      - ./data:/app/data
+      - ./.env:/app/.env:ro
+    environment:
+      - PYTHONPATH=/app/src
+    # For GPU support (MinerU / local LLM):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    stdin_open: true
+    tty: true

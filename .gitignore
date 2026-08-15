@@ -1,0 +1,42 @@
+# === Secrets & local config — NEVER commit ===
+.env
+*.env
+!.env.example
+
+# === API keys anywhere in the tree (defense-in-depth) ===
+secrets.env
+credentials.json
+*.key
+*.pem
+
+# === Runtime data (may contain extracted knowledge & literature metadata) ===
+data/
+outputs/
+logs/
+*.db
+*.sqlite3
+
+# === One-off diagnostic / debug scripts (kept locally, not published) ===
+archive/
+
+# === Local data backups & build artifacts ===
+data_backup_*/
+*.egg-info/
+
+# === Dev-only changelog (local reference, not published) ===
+update_log.md
+
+# === Python ===
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# === IDE / OS ===
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

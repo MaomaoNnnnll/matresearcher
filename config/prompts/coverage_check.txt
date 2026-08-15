@@ -1,0 +1,8 @@
+Subtask dimensions:
+{dims}
+
+Candidate papers (sample):
+{papers}
+
+For each subtask dimension, count how many papers are relevant.
+Return JSON array: [{{"dimension": "name", "count": N, "sample_ids": ["lit_0001", ...]}}]

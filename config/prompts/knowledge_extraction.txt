@@ -1,0 +1,26 @@
+你是一位材料科学知识抽取专家。请从以下文献段落中抽取结构化信息。
+
+文献标题：{title}
+段落内容：
+{content}
+
+请抽取以下字段，以JSON格式输出：
+{{
+  "material_composition": "化学式（如 Li7La3Zr2O12）",
+  "crystal_structure": "晶相/空间群（如 garnet, Ia-3d）",
+  "ionic_conductivity": {{"value": 1.0e-3, "unit": "S/cm", "temperature_K": 298}},
+  "electrochemical_window": {{"value": 4.5, "unit": "V"}},
+  "synthesis_method": "合成方法描述",
+  "sintering_temperature": {{"value": 1100, "unit": "C"}},
+  "test_temperature": {{"value": 298, "unit": "K"}},
+  "pressure": {{"value": 350, "unit": "MPa"}},
+  "simulation_method": "DFT|MD|蒙特卡洛|无",
+  "key_findings": "主要发现摘要",
+  "raw_quotes": ["支撑抽取值的原文引用片段"]
+}}
+
+注意：
+1. 数值必须附带原文中出现的单位，不要自行换算
+2. raw_quotes必须包含抽取数值对应的原文语句
+3. 如果某字段在段落中未出现，设为null
+4. 仅输出JSON，不要附加解释文字

@@ -1,0 +1,99 @@
+# MatResearcher Workflow Configuration
+# Maps to the 12-step pipeline (Step 1-12 in LangGraph)
+
+workflow:
+  name: matresearcher_pipeline
+  description: "固态电池材料文献调研多智能体工作流"
+
+  # Loop limits for verification checkpoints
+  coverage_check:
+    max_retries: 2        # Step 3: 检索覆盖度核验最大回退次数
+
+  data_quality_check:
+    enabled: true          # Step 7: 知识抽取内嵌数据质量核验（三分法）
+
+  logging:
+    enabled: true          # 是否启用日志落盘
+    output_dir: "outputs/logs"  # 日志文件输出目录（相对于项目根目录）
+
+agents:
+  # ── Default LLM configuration (shared by all agents unless overridden) ──
+  default_llm:
+    api_base: ${LLM_API_BASE}
+    # api_key: ${DASHSCOPE_API_KEY}
+    api_key: ${MINIMAX_API_KEY}
+    model: ${LLM_MODEL}
+    temperature: 0.3
+
+  task_planning:
+    model: ${LLM_MODEL}
+    temperature: 0.3
+    max_tokens: 8192              # Phase 2 策略生成最大输出 token（推理模型建议 16384）
+    reformulation_max_tokens: 4096  # Phase 1 查询改写最大输出 token
+
+  literature_search:
+    sciverse_top_k: 30    # 每次检索返回文献数
+    query_expansion: true
+    max_rounds: 3         # 查询扩展最大轮次（代码中当前未读取，保留配置）
+
+  literature_filter:
+    dedup_method: doi_title
+    rerank_top_k: 25      # 精筛后保留文献数
+    min_relevance_score: 0.5
+
+  llm_prefilter:
+    batch_size: 4          # 每批LLM调用处理的论文数
+    classification: three_way  # relevant | partial | irrelevant (only "irrelevant" discarded)
+
+  pdf_parsing:
+    engine: mineru         # mineru | marker
+    extract_tables: true
+    extract_figures: true
+    unpaywall_email: ""    # 你的邮箱 — Unpaywall API 必需参数（免费，100K次/天）
+
+  knowledge_extraction:
+    deep_extraction_top_n: 8       # 深度抽取（全9字段）的Top-N核心文献数
+    max_concurrent_extraction: 4   # 并行LLM调用上限（控制速率，防止API限流）
+    chunk_max_chars: 4000          # 语义分块每块最大字符数（句末标点优先，章节边界强制断块）
+    chunk_overlap_sentences: 0     # 相邻块重叠句子数（0=无重叠，学术论文推荐0）
+    fields:
+      - material_composition   # 材料组成
+      - crystal_structure       # 晶相/空间群 - 结构
+      - ionic_conductivity      # 导电率
+      - electrochemical_window # 电化学窗口
+      - synthesis_method       # 合成方法
+      - sintering_temperature  # 烧结温度
+      - test_temperature       # 测试温度
+      - pressure               # 压力
+      - simulation_method      # 模拟方法 (DFT/MD)
+    output_format: json
+
+  knowledge_fusion:
+    standard_units:
+      ionic_conductivity: "S/cm"
+      temperature: "K"
+      pressure: "MPa"
+    conflict_threshold: 0.5  # 同一材料性能差异超过50%标记为冲突
+
+  gap_identification:
+    min_supporting_papers: 2  # 每条Gap至少需要2篇支撑文献
+    scoring_weights:
+      novelty: 0.4
+      operability: 0.3
+      evidence_completeness: 0.3
+
+  evidence_verification:
+    require_exact_quote: true  # 核验时要求原文精确引用
+    max_verification_rounds: 2
+
+  report_generation:
+    output_format: markdown    # markdown | docx
+    output_mode: submission    # survey (文献调研报告) | submission (参赛方案文档)
+    project_name: "固态电池材料文献驱动的科学发现智能体"
+    distinguish_claims: true  # 区分 文献事实/跨文献推论/待验证假设
+  
+  pdf_parsing:
+    engine: mineru
+    extract_tables: true
+    extract_figures: true
+    unpaywall_email: "maomao050315@gmail.com"   

@@ -1,0 +1,29 @@
+你是一位材料科学Research Gap识别专家。请基于以下冲突清单和缺失清单，生成结构化的Research Gap。
+
+冲突清单：
+{conflicts}
+
+缺失清单：
+{missing}
+
+融合知识表摘要：
+{knowledge_summary}
+
+请生成Research Gap清单，每条Gap包含以下7个要素，以JSON数组格式输出：
+[{
+  "gap_id": "G1",
+  "description": "问题描述",
+  "supporting_literature": [{"doi": "...", "title": "...", "finding": "..."}],
+  "evidence_gap_or_conflict": "证据缺失说明或冲突描述",
+  "novelty": "与已有文献的区别（新知vs已知）",
+  "operability": "是否有明确的验证路径",
+  "falsifiable_hypothesis": "可证伪假设",
+  "suggested_verification": "建议验证方法（实验/计算）"
+}]
+
+注意：
+1. 每条Gap必须有至少2篇支撑文献
+2. novelty需明确区分"新发现"和"对已知现象的新角度"
+3. 可证伪假设必须是可被实验或计算验证的
+4. 仅基于提供的冲突和缺失清单，不要自由编造
+5. 仅输出JSON数组
