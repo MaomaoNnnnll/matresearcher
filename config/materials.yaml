@@ -1,0 +1,81 @@
+# Material-domain configuration for the quality-gate rule engine (R5/R6/R10)
+# and for structure-property analysis.
+#
+# Why this file exists
+# --------------------
+# The family conductivity windows and keyword tables used to be hardcoded as
+# class attributes in `agents/knowledge_extraction.py`, which meant the pipeline
+# could not be retargeted to another material domain (catalysis, thermoelectrics,
+# photovoltaics) without editing Python. Everything domain-specific now lives
+# here; the code falls back to built-in defaults if the file is missing or
+# malformed.
+
+domain:
+  name: solid-state-battery-electrolytes
+  property_under_study: ionic_conductivity
+  standard_unit: S/cm
+
+# Ordered keyword table — first match wins. Matched case-insensitively against
+# material_composition (covers plain-language names like "argyrodite" and
+# aliases like "LGPS"/"LLZO").
+family_keywords:
+  polymer: [peo, pvdf, ptmc, polymer, "poly(", "poly-", polystyrene,
+            polycarbonate, "poly(ethylene"]
+  borohydride: [libh4, bh4, borohydride]
+  sulfide: [lgps, argyrodite, li6ps5cl, lpsc, li7p3s11, sn2p2s6, thio,
+            sulfide, sulphide]
+  halide: [chloride, bromide, iodide, fluoride, halide, li3incl6, li3ycl6,
+           li2zrcl6, li3ycl]
+  oxide: [llzo, llzto, llzbo, garnet, nasicon, lisicon, latp, lagp, llto,
+          lipon, ltap, perovskite, oxide]
+
+# Per-family room-temperature windows used by R5/R6/R10.
+#   plausible_range: [min, max] in S/cm — outside this is REVIEW/FAIL
+#   warn_above     : value above this is flagged for review even if plausible
+#   label          : human-readable family description for reports
+conductivity_windows:
+  oxide:
+    plausible_range: [1.0e-9, 1.0e-1]
+    warn_above: 1.0e-2
+    label: "oxide (garnet/NASICON/perovskite)"
+  sulfide:
+    plausible_range: [1.0e-8, 1.0e-1]
+    warn_above: 5.0e-2
+    label: "sulfide (argyrodite/LGPS/thio-LISICON)"
+  halide:
+    plausible_range: [1.0e-9, 1.0e-2]
+    warn_above: 5.0e-3
+    label: "halide (Li3InCl6/Li3YCl6 family)"
+  polymer:
+    plausible_range: [1.0e-10, 1.0e-2]
+    warn_above: 1.0e-2
+    label: "polymer (PEO/PVDF-based)"
+  borohydride:
+    plausible_range: [1.0e-9, 1.0e-2]
+    warn_above: 1.0e-2
+    label: "borohydride (LiBH4-based)"
+
+# Hard numeric range checks (R1) — applied before family lookup.
+value_ranges:
+  ionic_conductivity_S_cm: [1.0e-10, 1.0]
+  temperature_K: [0, 3000]
+  electrochemical_window_V: [0, 10]
+  pressure_MPa: [0, 10000]
+
+# Unit-confusion detection (R6): rescaling by these factors is tested; if the
+# rescaled value lands inside the family window, a hint is emitted. The value is
+# never silently rewritten.
+unit_confusion_factors: [1000.0, 0.001]
+
+# Structure-property analysis (Step 8.5)
+structure_property:
+  # Minimum number of data points before a correlation is reported at all.
+  min_samples_for_correlation: 5
+  # Absolute Spearman rho below this is treated as "no signal".
+  min_abs_correlation: 0.3
+  # Host (undoped) reference formulas, used for the doped-vs-undoped contrast.
+  host_formulas:
+    oxide: Li7La3Zr2O12
+    sulfide: Li7P3S11
+  # Elements treated as dopants when present in a host-derived formula.
+  dopant_elements: [Al, Ga, Nb, Ta, In, B, Y, Zr, Ti, Ge, Sb, W, Mo, Ca, Sr, Ba, Fe, Zn, Mg]
