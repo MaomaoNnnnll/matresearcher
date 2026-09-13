@@ -191,7 +191,7 @@
 ### 9.1 安装依赖
 > ⚠️ 推荐使用**已建好的虚拟环境**直接运行，避免重复安装一大堆依赖：
 ```bash
-cd F:/projects/matresearcher
+cd matresearcher
 # 仅在首次（或依赖变更）时安装一次：
 .venv/Scripts/python.exe -m pip install -e .
 ```
