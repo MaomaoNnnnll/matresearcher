@@ -6,8 +6,14 @@ build-backend = "setuptools.build_meta"
 name = "matresearcher"
 version = "0.1.0"
 description = "MatResearcher: Multi-agent literature survey system for solid-state battery materials"
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 license = {text = "Apache-2.0"}
+# NOTE: pyproject.toml (not requirements.txt) is the single source of truth.
+# requirements.txt used to carry four extra runtime packages that were missing
+# here, so `pip install -e .` produced an environment that crashed on import
+# (`env_loader` imports python-dotenv at runtime; embedding/reranker need
+# sentence-transformers). Keep the two lists in sync — requirements.txt mirrors
+# this block plus the dev/api extras.
 dependencies = [
     "langgraph>=0.2.0",
     "pydantic>=2.0",
@@ -19,10 +25,20 @@ dependencies = [
     "rich>=13.0",
     "typer>=0.12",
     "tenacity>=8.0",
+    # --- previously only in requirements.txt (runtime-critical) ---
+    "python-dotenv>=1.0",
+    "sentence-transformers>=5.0",
+    "transformers>=5.0",
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "sciverse>=0.14.2",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+# `matresearcher serve` needs these; they stay optional so a CLI-only install
+# does not pull in a web stack.
+api = ["fastapi>=0.110", "uvicorn>=0.27"]
 
 [project.scripts]
 matresearcher = "matresearcher.main:app"

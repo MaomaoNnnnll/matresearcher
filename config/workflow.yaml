@@ -1,5 +1,8 @@
 # MatResearcher Workflow Configuration
-# Maps to the 12-step pipeline (Step 1-12 in LangGraph)
+# Base pipeline is 12 core steps (Step 1-12 in LangGraph); Step 8.5 (structure-property)
+# is inserted by default, and Step 10.5 (MP/Sci-Base cross-check) inserts when
+# materials_project.enabled=true. Two conditional branches: coverage_check fallback
+# and fact_check rewrite loop.
 
 workflow:
   name: matresearcher_pipeline
@@ -12,6 +15,13 @@ workflow:
   data_quality_check:
     enabled: true          # Step 7: 知识抽取内嵌数据质量核验（三分法）
 
+  # Step 8.5: quantitative structure-property (构效关系) analysis.
+  # When enabled, the engine inserts a structure_property node between
+  # knowledge_fusion and gap_generation, and its findings are rendered into the
+  # survey report. Tunables live in config/materials.yaml (structure_property.*).
+  structure_property_analysis:
+    enabled: true
+
   logging:
     enabled: true          # 是否启用日志落盘
     output_dir: "outputs/logs"  # 日志文件输出目录（相对于项目根目录）
@@ -20,8 +30,10 @@ agents:
   # ── Default LLM configuration (shared by all agents unless overridden) ──
   default_llm:
     api_base: ${LLM_API_BASE}
-    # api_key: ${DASHSCOPE_API_KEY}
-    api_key: ${MINIMAX_API_KEY}
+    # LLM_API_KEY is the canonical secret (set in ~/.matresearcher/secrets.env).
+    # Provider-specific aliases (DASHSCOPE_API_KEY / MINIMAX_API_KEY) are also
+    # accepted and resolved by src/matresearcher/tools/llm.py from api_base.
+    api_key: ${LLM_API_KEY}
     model: ${LLM_MODEL}
     temperature: 0.3
 
@@ -35,6 +47,11 @@ agents:
     sciverse_top_k: 30    # 每次检索返回文献数
     query_expansion: true
     max_rounds: 3         # 查询扩展最大轮次（代码中当前未读取，保留配置）
+    # ── Title→DOI 补全（Sciverse /agentic-search 多数命中缺 DOI，用标题回补）──
+    doi_enrichment: true                 # 总开关：用标题补全缺失 DOI
+    doi_enrichment_sciverse_meta: true   # 次级数据源：Sciverse /meta-search 按标题补 DOI
+    doi_enrichment_timeout: 10.0         # 单次外部查询超时（秒）
+    # doi_enrichment_email: "you@example.com"  # 可选：写入 Crossref User-Agent，进入 polite pool（更高配额）
 
   literature_filter:
     dedup_method: doi_title
@@ -49,7 +66,10 @@ agents:
     engine: mineru         # mineru | marker
     extract_tables: true
     extract_figures: true
-    unpaywall_email: ""    # 你的邮箱 — Unpaywall API 必需参数（免费，100K次/天）
+    # 邮箱从环境变量 / 密钥文件读取（避免把个人邮箱提交进仓库）。
+    # 可写入项目 .env，或推荐写入 ~/.matresearcher/secrets.env：
+    #   UNPAYWALL_EMAIL=you@example.com
+    unpaywall_email: ${UNPAYWALL_EMAIL}   # Unpaywall API 必需参数（免费，100K次/天）；未设置则跳过 OA PDF 下载
 
   knowledge_extraction:
     deep_extraction_top_n: 8       # 深度抽取（全9字段）的Top-N核心文献数
@@ -82,18 +102,28 @@ agents:
       operability: 0.3
       evidence_completeness: 0.3
 
+  # ── Materials Project + Sci-Base 假设交叉核验 (Step 10.5) ──
+  # enabled=true 时，引擎会在 evidence_verification 与 report_generation 之间
+  # 插入 hypothesis_crosscheck 节点，对每个 Gap 的"可证伪假设"做外部/离线交叉核验。
+  # 无 MATERIALS_PROJECT_API_KEY 时自动降级到 Sci-Base 本地离线语料；二者皆无则
+  # 输出 skipped，绝不阻断主流程。
+  materials_project:
+    enabled: false            # 默认关闭：需要环境变量 MATERIALS_PROJECT_API_KEY 才真正启用在线核验
+    api_base: "https://api.materialsproject.org"
+    scibase_fallback: true    # 启用本地关系库离线兜底
+
   evidence_verification:
     require_exact_quote: true  # 核验时要求原文精确引用
     max_verification_rounds: 2
+    # ── 证据核验判定阈值（原来硬编码在代码里）──
+    min_match_score: 0.7        # 单条支撑文献段落匹配分 ≥ 该值才算"已核验"（0.5 过低，0.53/0.55 等弱语义匹配曾被误判为 VERIFIED）
+    min_verified_coverage: 0.8  # 有锚点支撑文献的核验通过比例 ≥ 该值 → Gap 判定 passed
+                                # （旧逻辑要求 100%，导致某次运行出现 0/3 通过）
+    # ── Step 12 事实核查闭环 ──
+    max_revisions: 2            # 发现问题后最多回退重写 2 轮，仍遗留的问题附于报告末供人工复核
 
   report_generation:
     output_format: markdown    # markdown | docx
     output_mode: submission    # survey (文献调研报告) | submission (参赛方案文档)
     project_name: "固态电池材料文献驱动的科学发现智能体"
     distinguish_claims: true  # 区分 文献事实/跨文献推论/待验证假设
-  
-  pdf_parsing:
-    engine: mineru
-    extract_tables: true
-    extract_figures: true
-    unpaywall_email: "maomao050315@gmail.com"   
