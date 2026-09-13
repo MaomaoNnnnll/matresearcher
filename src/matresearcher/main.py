@@ -80,7 +80,13 @@ def survey(
             console.print(f"\n[red]Error: {result['error']}[/red]")
             raise typer.Exit(1)
 
-        report = result.get("final_report", result.get("draft_report", ""))
+        # submission 模式下优先取 submission_report（参赛方案文档）；
+        # survey 模式该行返回空串，自动退回 final_report / draft_report（survey 报告）。
+        report = (
+            result.get("submission_report")
+            or result.get("final_report")
+            or result.get("draft_report", "")
+        )
         generate_time = datetime.now().strftime("%Y%m%d%H%M%S")
 
         # Write report to output file — same run folder as logs
@@ -140,7 +146,11 @@ def serve(
         workflow = MatResearcherWorkflow()
         result = await workflow.run(question)
         return {
-            "report": result.get("final_report", result.get("draft_report", "")),
+            "report": (
+                result.get("submission_report")
+                or result.get("final_report")
+                or result.get("draft_report", "")
+            ),
             "step_log": result.get("step_log", []),
         }
 
@@ -170,10 +180,14 @@ def evaluate(
         rag       - Single-agent RAG pipeline
         all       - Run all baselines
     """
-    from ...scripts.evaluate import run_evaluation
+    # NOTE: this used to be `from ...scripts.evaluate import run_evaluation`,
+    # a 3-level relative import beyond the top-level package that raised
+    # `ImportError: attempted relative import beyond top-level package` at
+    # runtime. The harness now lives inside the package (see evaluation/).
+    from .evaluation import run_evaluation, DEFAULT_QUESTION
 
     if not question:
-        question = "What are the ionic conductivity values of LLZO garnet electrolytes?"
+        question = DEFAULT_QUESTION
 
     console.print(f"[cyan]Running evaluation for: {question}[/cyan]")
     console.print(f"[dim]Baseline: {baseline}[/dim]")

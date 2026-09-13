@@ -1,10 +1,15 @@
-"""Knowledge Fusion Agent (Steps 8-11).
+"""Knowledge Fusion Agent (pipeline Step 8).
 
-Responsibilities:
-- Step 8: Unit normalization & chemical formula normalization
-- Step 9: Store to vector DB + relational DB
-- Step 10: Cross-literature knowledge fusion (per-material aggregation)
-- Step 11: Conflict detection & missing connection detection
+Internal sub-phases are logged as 8.1-8.4 so they nest under the node-level
+"Step 8" banner from the workflow wrapper. They must NOT reuse the global
+step counter (8/9/10/11): doing so collides with downstream node banners
+(Step 9 gap generation, Step 10 evidence verification, Step 11 report,
+Step 12 fact-check) and produces a confusing "10 then back to 8" sequence.
+
+- 8.1: Unit normalization & chemical formula normalization
+- 8.2: Store to vector DB + relational DB
+- 8.3: Cross-literature knowledge fusion (per-material aggregation)
+- 8.4: Conflict detection & missing connection detection
 """
 from __future__ import annotations
 
@@ -67,23 +72,27 @@ class KnowledgeFusionAgent(BaseAgent):
                     "conflicts": [], "missing_items": []}
 
         self.log(f"Fusing {len(all_records)} knowledge records from {len(filtered)} papers")
+
+        # 8.1: Normalize units & chemical formulas
+        self.log_step("8.1", "归一化 (单位换算 + 化学式归一)")
         normalized = self._normalize_records(all_records)
+        self.log_step("8.1", f"{len(normalized)} 条记录已归一化", "done")
 
-        # Step 9: Store to databases
-        self.log_step("9", "存储到向量库 + 关系库")
+        # 8.2: Store to databases
+        self.log_step("8.2", "存储到向量库 + 关系库")
         self._store_records(normalized)
-        self.log_step("9", f"{len(normalized)} 条记录已存储", "done")
+        self.log_step("8.2", f"{len(normalized)} 条记录已存储", "done")
 
-        # Step 10: Cross-literature fusion
-        self.log_step("10", "跨文献知识融合")
+        # 8.3: Cross-literature fusion
+        self.log_step("8.3", "跨文献知识融合")
         fused_table = self._fuse_knowledge(normalized)
-        self.log_step("10", f"{fused_table.total_materials} 种材料已融合", "done")
+        self.log_step("8.3", f"{fused_table.total_materials} 种材料已融合", "done")
 
-        # Step 11: Conflict & missing detection
-        self.log_step("11", "冲突检测与缺失发现")
+        # 8.4: Conflict & missing detection
+        self.log_step("8.4", "冲突检测与缺失发现")
         conflicts = self.conflict_detector.detect_conflicts(normalized)
         missing_items = self.conflict_detector.detect_missing(normalized)
-        self.log_step("11", f"{len(conflicts)} 条冲突, {len(missing_items)} 条缺失", "done")
+        self.log_step("8.4", f"{len(conflicts)} 条冲突, {len(missing_items)} 条缺失", "done")
 
         # Add results to fused table
         fused_table.conflict_list = conflicts
@@ -100,7 +109,7 @@ class KnowledgeFusionAgent(BaseAgent):
         }
 
     def _normalize_records(self, records: list[KnowledgeRecord]) -> list[NormalizedRecord]:
-        """Step 8: Normalize all records.
+        """Sub-phase 8.1: Normalize all records.
 
         - Convert units to standard (S/cm, K, MPa)
         - Normalize chemical formulas
@@ -153,7 +162,7 @@ class KnowledgeFusionAgent(BaseAgent):
         return mapped
 
     def _store_records(self, records: list[NormalizedRecord]):
-        """Step 9: Store normalized records to vector DB and relational DB."""
+        """Sub-phase 8.2: Store normalized records to vector DB and relational DB."""
         collection = self.config.get("vector_collection", "knowledge")
 
         # Store to vector DB for semantic retrieval
@@ -199,7 +208,7 @@ class KnowledgeFusionAgent(BaseAgent):
                 self.log(f"Relational store error: {e}", "yellow")
 
     def _fuse_knowledge(self, records: list[NormalizedRecord]) -> FusedKnowledgeTable:
-        """Step 10: Cross-literature knowledge fusion.
+        """Sub-phase 8.3: Cross-literature knowledge fusion.
 
         Groups records by material and computes aggregated statistics.
         """

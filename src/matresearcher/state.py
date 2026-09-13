@@ -1,7 +1,9 @@
 """Workflow state definition for LangGraph.
 
 This TypedDict is the shared state object passed through the entire
-18-step pipeline (steps 1-16 + 4a + 7a).
+12-step pipeline (steps 1-12), with two optional nodes (Step 8.5
+structure-property analysis, Step 10.5 hypothesis cross-check) mounted
+when enabled in config/workflow.yaml.
 """
 from __future__ import annotations
 
@@ -54,8 +56,40 @@ class WorkflowState(TypedDict, total=False):
     scored_gaps: list[ResearchGap]              # sorted by score
 
     # --- Step 15-16: Report ---
-    draft_report: str                           # raw markdown
+    draft_report: str                           # SURVEY markdown (文献调研报告本体；事实核查修订闭环基于它)
     final_report: str                           # verified markdown
+    # Submission-mode deliverable (参赛方案文档). Kept SEPARATE from draft_report so
+    # that draft_report always stays the survey report (with 参考文献清单 + 构效关系)
+    # and the fact-check revision loop rewrites the survey, not the submission.
+    submission_report: str                      # 参赛方案文档（output_mode=submission 时由 survey 改写而来；survey 模式为空串）
+
+    # --- Step 12 closed loop: fact-check → regenerate → re-check ---
+    # Previously fact_check only APPENDED an issue log to the draft and the
+    # pipeline ended, so a report could ship with "11 条待确认项" still inside
+    # it. The graph now routes back to report_generation while `needs_revision`
+    # is True, up to `fact_check.max_revisions` times.
+    fact_check_issues: list[str]                # issues found in the latest pass
+    fact_check_revision: int                    # regeneration rounds used so far
+    fact_check_status: str                      # clean | revised | unresolved
+    needs_revision: bool                        # router flag
+    # Per-claim machine-checkable results and human-readable correction
+    # suggestions returned by the fact_check node. Declared as state channels
+    # so LangGraph propagates them instead of silently dropping them
+    # (same trap class as the old _structure_property_md bug).
+    fact_check_checks: list[dict]               # structured check results
+    fact_check_corrections: list[str]           # human-readable correction suggestions
+
+    # --- Step 8.5: structure-property analysis (optional) ---
+    structure_property_result: dict
+    # CRITICAL: this key MUST be declared as a state channel. node_structure_property
+    # returns it and report_generation reads it; without declaration LangGraph's
+    # state schema silently drops the undeclared key, so the 构效关系 chapter
+    # never reaches the report (observed 2026-09-11: pkl had the content, report
+    # did not). Declaring it lets the channel propagate across the graph.
+    _structure_property_md: str
+
+    # --- Step 10.5: hypothesis cross-check against external / offline corpus ---
+    hypothesis_cross_checks: list[dict]
 
     # --- Metadata ---
     config: dict                                # workflow configuration

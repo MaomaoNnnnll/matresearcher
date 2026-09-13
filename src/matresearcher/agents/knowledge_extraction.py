@@ -38,6 +38,11 @@ from typing import Optional
 from ..state import WorkflowState
 from .base import BaseAgent
 from ..models.knowledge import KnowledgeRecord, NumericValue
+from ..rules.material_config import (
+    load_material_config,
+    family_keywords,
+    conductivity_window,
+)
 
 
 KNOWLEDGE_EXTRACTION_PROMPT = """You are a materials science expert. Extract structured knowledge from the following paper section.
@@ -132,28 +137,13 @@ class KnowledgeExtractionAgent(BaseAgent):
     )
 
     # ── R5: material-family classification for threshold lookup ──
-    # Ordered keyword table: first match wins. Keywords are matched
-    # case-insensitively against material_composition (covers plain-language
-    # names like "argyrodite" and aliases like "LGPS" / "LLZO").
-    _FAMILY_KEYWORDS = [
-        ("polymer", (
-            "peo", "pvdf", "ptmc", "polymer", "poly(", "poly-",
-            "polystyrene", "polycarbonate", "poly(ethylene",
-        )),
-        ("borohydride", ("libh4", "bh4", "borohydride")),
-        ("sulfide", (
-            "lgps", "argyrodite", "li6ps5cl", "lpsc", "li7p3s11",
-            "sn2p2s6", "thio", "sulfide", "sulphide",
-        )),
-        ("halide", (
-            "chloride", "bromide", "iodide", "fluoride", "halide",
-            "li3incl6", "li3ycl6", "li2zrcl6", "li3ycl",
-        )),
-        ("oxide", (
-            "llzo", "llzto", "llzbo", "garnet", "nasicon", "lisicon",
-            "latp", "lagp", "llto", "lipon", "ltap", "perovskite", "oxide",
-        )),
-    ]
+    # Loaded from config/materials.yaml via rules/material_config.py (with
+    # built-in fallbacks), so the domain can be retargeted by editing the YAML
+    # instead of this Python file. Keywords are matched case-insensitively
+    # against material_composition (covers plain-language names like
+    # "argyrodite" and aliases like "LGPS" / "LLZO").
+    _MATERIAL_CFG = load_material_config()
+    _FAMILY_KEYWORDS = family_keywords(_MATERIAL_CFG)
 
     # Element-symbol probes for the formula fallback (case-sensitive).
     # An element symbol in a chemical formula is an uppercase letter
@@ -168,14 +158,17 @@ class KnowledgeExtractionAgent(BaseAgent):
         "F": re.compile(r"F(?=[A-Z]|$)"),
     }
 
-    # R5: per-family conductivity windows at room temperature (S/cm).
-    # (plausible_range, warn_above, label)
+    # R5: per-family conductivity windows at room temperature (S/cm),
+    # sourced from config/materials.yaml (fallback defaults if absent).
+    # Stored as ((plausible_range_lo, plausible_range_hi), warn_above, label)
+    # to keep the consumption site unchanged.
     _FAMILY_CONDUCTIVITY = {
-        "oxide":       ((1e-9, 1e-1), 1e-2, "oxide (garnet/NASICON/perovskite)"),
-        "sulfide":     ((1e-8, 1e-1), 5e-2, "sulfide (argyrodite/LGPS/thio-LISICON)"),
-        "halide":      ((1e-9, 1e-2), 5e-3, "halide (Li3InCl6/Li3YCl6 family)"),
-        "polymer":     ((1e-10, 1e-2), 1e-2, "polymer (PEO/PVDF-based)"),
-        "borohydride": ((1e-9, 1e-2), 1e-2, "borohydride (LiBH4-based)"),
+        fam: (
+            tuple(w.get("plausible_range", [1e-12, 1.0])),
+            w.get("warn_above", 1.0),
+            w.get("label", fam),
+        )
+        for fam, w in _MATERIAL_CFG.get("conductivity_windows", {}).items()
     }
 
     @classmethod
@@ -1535,12 +1528,19 @@ class KnowledgeExtractionAgent(BaseAgent):
         if not text:
             return text
 
-        # 1) Drop whole-line markdown image placeholders + stray page numbers
+        # 1) Handle markdown image placeholders + stray page numbers.
+        # P3-16: retain the figure caption text instead of discarding the whole
+        # line — the caption often carries the only legible description of a
+        # figure/plot, and dropping it loses information the LLM could use.
         lines = []
         for ln in text.splitlines():
             s = ln.strip()
-            if re.fullmatch(r"!\[[^\]]*\]\([^)]*\)", s):
-                continue  # pure image placeholder line — drop entirely
+            m = re.fullmatch(r"!\[([^\]]*)\]\([^)]*\)", s)
+            if m:
+                caption = m.group(1).strip()
+                if caption:
+                    lines.append(f"图注: {caption}")
+                continue  # rendering artifact / empty placeholder — no prose
             # MinerU image rows may carry a trailing metadata suffix after the
             # closing paren, e.g. "![](image)ult=success/type=image/dt=.../hash.jpg".
             # Any line that STARTS with an image placeholder is a rendering

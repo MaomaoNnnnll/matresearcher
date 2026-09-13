@@ -1,4 +1,4 @@
-"""Literature Search Agent (Step 4).
+"""Literature Search Agent (Step 2).
 
 Responsibilities:
 - Phase 1: Per-subtask dimension-specific search (keywords + semantic_query per subtask)
@@ -9,12 +9,14 @@ Responsibilities:
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 from typing import Optional
 
 from ..state import WorkflowState
 from .base import BaseAgent, PROMPTS_DIR
 from ..tools.sciverse import SciverseClient
+from ..tools.doi_enrichment import DOIEnricher
 from ..models.literature import Literature, LiteratureMetadata
 
 
@@ -104,12 +106,46 @@ class LiteratureSearchAgent(BaseAgent):
                 phase_counts["phase3_expanded"] = p3_count
                 self.log(f"Phase 3 total: {p3_count} results")
         else:
-            self.log("Sciverse API not configured, using mock results", "yellow")
+            # Wording matters: nothing here fabricates data (all_results stays
+            # empty and the run yields zero candidates), but the old message
+            # said "using mock results", which reads as fabricated literature
+            # and contradicts the "zero mock data" claim in the proposal.
+            self.log(
+                "Sciverse API not configured — no literature can be retrieved "
+                "(set SCIVERSE_API_KEY in ~/.matresearcher/secrets.env); "
+                "returning an empty candidate list",
+                "yellow",
+            )
 
         # Convert to Literature objects (passes _query_source through)
         candidate_literature = self._to_literature(all_results)
 
-        # Dedup by DOI/title (prefer original over reformulated/expanded)
+        # ── Title→DOI enrichment ──
+        # Sciverse /agentic-search returns a null DOI for the majority of hits, so
+        # recover resolvable DOIs from the paper title (Crossref primary, Sciverse
+        # meta-search secondary) before dedup + persistence. Best-effort: a failure
+        # leaves records unchanged and the run continues.
+        if self.config.get("doi_enrichment", True):
+            enricher = DOIEnricher(
+                sciverse=self.sciverse,
+                timeout=self.config.get("doi_enrichment_timeout", 10.0),
+                use_sciverse_meta=self.config.get("doi_enrichment_sciverse_meta", True),
+                crossref_email=self.config.get("doi_enrichment_email"),
+            )
+            try:
+                await enricher.enrich(candidate_literature)
+                n_doi = sum(1 for l in candidate_literature if l.metadata.doi)
+                self.log(
+                    f"DOI enrichment: {n_doi}/{len(candidate_literature)} candidates "
+                    f"now carry a resolvable DOI"
+                )
+            except Exception as e:  # noqa: BLE001 - enrichment must never abort the run
+                self.log(f"  DOI enrichment failed (best-effort, continuing): {e}", "yellow")
+            finally:
+                await enricher.close()
+
+        # Dedup by DOI/title (prefer original over reformulated/expanded, and
+        # always keep the copy that actually carries a DOI)
         before_dedup = len(candidate_literature)
         candidate_literature = self._dedup(candidate_literature)
         removed = before_dedup - len(candidate_literature)
@@ -221,7 +257,7 @@ class LiteratureSearchAgent(BaseAgent):
                 id=f"lit_{i:04d}",
                 relevance_score=r.get("score"),  # Sciverse raw relevance score (agentic-search); meta-search has no score
                 metadata=LiteratureMetadata(
-                    doi=r.get("doi"),
+                    doi=_extract_doi(r),
                     title=r.get("title", ""),
                     authors=r.get("authors", []),
                     journal=r.get("journal"),
@@ -241,30 +277,106 @@ class LiteratureSearchAgent(BaseAgent):
         return literature
 
     def _dedup(self, literature: list[Literature]) -> list[Literature]:
-        """Deduplicate by DOI or title.
+        """Deduplicate by title (preferring the copy that carries a DOI).
 
-        When the same paper appears from multiple query sources, keep the one
-        with the highest-priority source: original > reformulated > expanded.
+        Sciverse returns the same paper from multiple query sources, and the
+        agentic-search copy usually has ``doi=null`` while the meta-search copy
+        carries the real DOI. Keying on ``doi if present else title`` used to let
+        both copies survive as different keys, so the DOI-bearing copy was never
+        preferred. We now collapse by normalized title and always keep the copy
+        that has a DOI (then higher-priority source, then higher relevance).
         """
         # Priority order for query_source
         _SRC_PRIORITY = {"original": 0, "reformulated": 1, "expanded": 2, "fallback": 3}
 
-        seen: dict[str, Literature] = {}
+        def quality(lit: Literature) -> tuple:
+            m = lit.metadata
+            return (
+                0 if m.doi else 1,                     # 1) prefer a copy WITH a DOI
+                _SRC_PRIORITY.get(m.query_source, 99),  # 2) prefer original source
+                -(lit.relevance_score or 0.0),          # 3) prefer higher relevance
+            )
+
+        by_title: dict[str, Literature] = {}
+        no_title: dict[str, Literature] = {}  # keyed by DOI when title is absent
         for lit in literature:
-            doi = lit.metadata.doi
-            title = lit.metadata.title.lower().strip()
-            key = doi if doi else title
-            if not key:
+            m = lit.metadata
+            title = (m.title or "").lower().strip()
+            if title:
+                cur = by_title.get(title)
+                if cur is None or quality(lit) < quality(cur):
+                    by_title[title] = lit
+            elif m.doi:
+                no_title.setdefault(m.doi, lit)
+
+        survivors = list(by_title.values())
+        # A title-less, DOI-bearing copy is redundant if its DOI already appears
+        # among the title-keyed survivors (same paper, just missing a title).
+        title_dois = {lit.metadata.doi for lit in survivors if lit.metadata.doi}
+        merged = list(survivors)
+        for lit in no_title.values():
+            if lit.metadata.doi in title_dois:
                 continue
+            merged.append(lit)
+        return merged
 
-            existing = seen.get(key)
-            if existing is None:
-                seen[key] = lit
-            else:
-                # Keep the one with higher-priority (lower number) query_source
-                cur_pri = _SRC_PRIORITY.get(lit.metadata.query_source, 99)
-                exist_pri = _SRC_PRIORITY.get(existing.metadata.query_source, 99)
-                if cur_pri < exist_pri:
-                    seen[key] = lit
+def _extract_doi(raw: dict) -> Optional[str]:
+    """Robustly extract a real DOI from a Sciverse/Crossref-style API record.
 
-        return list(seen.values())
+    Sciverse responses are inconsistent: some carry a top-level ``doi``, others
+    nest it (e.g. ``externalIds.DOI``), and many only expose a ``pdf_url`` /
+    ``link`` whose path contains the ``10.xxxx/...`` DOI string. Missing DOIs
+    would otherwise leave evidence verification unable to cite a resolvable
+    reference, so we triangulate from every plausible source.
+    """
+    if not isinstance(raw, dict):
+        return None
+
+    # 1. Direct top-level keys
+    for key in ("doi", "DOI", "Doi"):
+        v = raw.get(key)
+        if isinstance(v, str) and v.strip():
+            return _normalize_doi(v)
+
+    # 2. Nested external-id blocks (Semantic Scholar / Crossref conventions)
+    for container in ("externalIds", "identifiers", "external_ids"):
+        obj = raw.get(container)
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if isinstance(k, str) and k.upper() in ("DOI", "DOI_URL") and isinstance(v, str) and v.strip():
+                    return _normalize_doi(v)
+        elif isinstance(obj, list):  # e.g. [{"type": "DOI", "value": "10.x/..."}]
+            for item in obj:
+                if isinstance(item, dict) and str(item.get("type", "")).upper() == "DOI":
+                    val = item.get("value") or item.get("id")
+                    if isinstance(val, str) and val.strip():
+                        return _normalize_doi(val)
+
+    # 3. Parse from any URL-like field that embeds a DOI
+    for key in ("pdf_url", "url", "link", "links", "full_text_url", "source_url"):
+        v = raw.get(key)
+        candidates = v if isinstance(v, list) else [v]
+        for c in candidates:
+            if not isinstance(c, str):
+                continue
+            d = _normalize_doi(c)
+            if d:
+                return d
+    return None
+
+
+_DOI_RE = re.compile(r"10\.\d{4,9}/[^\s\"'<>]+")
+
+
+def _normalize_doi(value: str) -> Optional[str]:
+    """Strip resolver prefixes / whitespace and validate the DOI shape."""
+    if not value:
+        return None
+    s = value.strip().rstrip(".")
+    # Drop common resolver prefixes: https://doi.org/, dx.doi.org/, doi:
+    s = re.sub(r"^(https?://)?(dx\.)?doi\.org/", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"(?i)^doi[:\s]+", "", s)
+    s = s.strip()
+    if not _DOI_RE.match(s):
+        return None
+    return s

@@ -38,8 +38,13 @@ class MinerUParser:
         elif _mineru_cli_available():
             return await self._parse_via_cli(literature_id, pdf_path)
         else:
-            console.print("[yellow]Warning: MinerU not available, using mock parser[/yellow]")
-            return await self._parse_mock(literature_id, pdf_path)
+            # Not a mock: PyMuPDF extracts the real text layer. Renamed because
+            # "mock parser" in the logs read as fabricated document content.
+            console.print(
+                "[yellow]Warning: MinerU not available, falling back to "
+                "PyMuPDF text extraction (layout/tables/figures unavailable)[/yellow]"
+            )
+            return await self._parse_fallback_pymupdf(literature_id, pdf_path)
 
     async def _parse_via_api(self, literature_id: str, pdf_path: str) -> ParsedDocument:
         """Call MinerU REST API."""
@@ -104,8 +109,8 @@ class MinerUParser:
                 error_message=str(e),
             )
 
-    async def _parse_mock(self, literature_id: str, pdf_path: str) -> ParsedDocument:
-        """Fallback: read raw text from PDF (limited)."""
+    async def _parse_fallback_pymupdf(self, literature_id: str, pdf_path: str) -> ParsedDocument:
+        """Fallback: read raw text from PDF via PyMuPDF (real text, no layout)."""
         try:
             # Try PyMuPDF if available, otherwise return empty
             import fitz  # type: ignore

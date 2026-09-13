@@ -58,6 +58,9 @@ class ResearchGap(BaseModel):
     # Step 13: evidence verification
     verification_status: str = "pending"     # pending | passed | partial | failed | unverified
     verification_notes: Optional[str] = None
+    # Fraction of anchor-bearing supporting refs that verified against the
+    # full text (0-1). Drives the coverage-based pass judgement.
+    verification_coverage: Optional[float] = None
     correction_suggestions: list[str] = Field(default_factory=list)
 
     # Step 14: scoring

@@ -20,6 +20,7 @@ class LiteratureMetadata(BaseModel):
     abstract: Optional[str] = None
     keywords: list[str] = Field(default_factory=list)
     pdf_url: Optional[str] = None
+    url: Optional[str] = None       # resolvable landing URL (e.g. Sciverse paper page) when DOI is unavailable
     doc_id: Optional[str] = None    # Sciverse doc_id for full-text retrieval via /content
     chunk: Optional[str] = None     # Text snippet from agentic-search (fallback)
     is_content_accessible: bool = True  # Sciverse flag: whether /content is available for this paper
@@ -62,7 +63,13 @@ class Literature(BaseModel):
         year = self.metadata.year or "n.d."
         title = self.metadata.title[:80]
         journal = self.metadata.journal or ""
-        return f"{authors} ({year}). {title}. {journal}. DOI: {self.metadata.doi or 'N/A'}"
+        if self.metadata.doi:
+            ident = f"DOI: {self.metadata.doi}"
+        elif self.metadata.url:
+            ident = f"URL: {self.metadata.url}"
+        else:
+            ident = "N/A"
+        return f"{authors} ({year}). {title}. {journal}. {ident}"
 
 
 # Resolve forward reference to KnowledgeRecord (Pydantic v2 requires explicit rebuild).

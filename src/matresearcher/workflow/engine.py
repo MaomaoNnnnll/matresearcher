@@ -1,4 +1,4 @@
-"""LangGraph workflow engine for the MatResearcher 12-step pipeline.
+"""LangGraph workflow engine for the MatResearcher pipeline (12 core steps + optional Step 8.5/10.5 extensions, 2 conditional branches).
 
 Pipeline:
   Step 1:   Task Planning and Search Strategy Generation
@@ -14,10 +14,14 @@ Pipeline:
   Step 11:     Report Generation
   Step 12:     Final Fact Check
 
-Conditional edges:
+Conditional edges (2):
   - After coverage_check: if not passed → refine strategy → back to literature_search
-  - coverage_check passed → llm_prefilter → literature_filter
-  - All other steps: linear progression
+  - After fact_check: while revisions remain → back to report_generation; else → END
+
+Two optional nodes are inserted when enabled in config/workflow.yaml:
+  - structure_property (Step 8.5): knowledge_fusion → structure_property → gap_generation
+  - hypothesis_crosscheck (Step 10.5): evidence_verification → hypothesis_crosscheck
+    → report_generation
 """
 from __future__ import annotations
 
@@ -38,6 +42,16 @@ from .nodes import create_all_nodes
 from .run_cache import RunCache
 
 console = Console()
+
+# Nodes that are part of a back-edge (cycle) in the graph. The run-level node
+# cache is keyed only by node NAME (no input hash) and is consulted both across
+# process runs (--resume) and within a single run. For nodes on a cycle the
+# cache is semantically wrong: on the 2nd loop visit it replays a STALE patch
+# (e.g. the previous fact_check result with revision=1 / needs_revision=True),
+# so the fact_check counter never advances and the loop spins forever until the
+# recursion limit is hit. Excluding these nodes from the cache guarantees the
+# loop re-executes fresh each pass and terminates after max_revisions rounds.
+LOOP_NODES = {"report_generation", "fact_check"}
 
 
 class MatResearcherWorkflow:
@@ -140,14 +154,50 @@ class MatResearcherWorkflow:
         graph.add_edge("literature_filter", "pdf_parsing")
         graph.add_edge("pdf_parsing", "knowledge_extraction")
         graph.add_edge("knowledge_extraction", "knowledge_fusion")
-        graph.add_edge("knowledge_fusion", "gap_generation")
+
+        # Step 8.5 (optional): quantitative structure-property analysis.
+        # Present in self.nodes only when enabled in config/workflow.yaml.
+        if "structure_property" in self.nodes:
+            graph.add_edge("knowledge_fusion", "structure_property")
+            graph.add_edge("structure_property", "gap_generation")
+        else:
+            graph.add_edge("knowledge_fusion", "gap_generation")
+
         graph.add_edge("gap_generation", "evidence_verification")
-        graph.add_edge("evidence_verification", "report_generation")
+
+        # Step 10.5 (optional): cross-check each gap's hypothesis against the
+        # Materials Project API + Sci-Base offline corpus. Present in self.nodes
+        # only when materials_project is enabled in config/workflow.yaml.
+        if "hypothesis_crosscheck" in self.nodes:
+            graph.add_edge("evidence_verification", "hypothesis_crosscheck")
+            graph.add_edge("hypothesis_crosscheck", "report_generation")
+        else:
+            graph.add_edge("evidence_verification", "report_generation")
+
         graph.add_edge("report_generation", "fact_check")
-        graph.add_edge("fact_check", END)
+
+        # ── Fact-check closed loop ──
+        # Instead of ending with a report that still contains its own issue log,
+        # send the draft back to report_generation while revisions remain.
+        graph.add_conditional_edges(
+            "fact_check",
+            self._route_after_fact_check,
+            {
+                "revise": "report_generation",
+                "done": END,
+            },
+        )
 
         self._compiled = graph.compile()
         return self._compiled
+
+    def _route_after_fact_check(self, state: WorkflowState) -> str:
+        """Conditional routing after Step 12 fact-check.
+
+        Returns "revise" while issues remain and the revision budget
+        (`agents.evidence_verification.max_revisions`) is not exhausted;
+        otherwise ends the run."""
+        return "revise" if state.get("needs_revision") else "done"
 
     def _wrap_node(self, name: str, func):
         """Wrap a LangGraph node with run-cache check/save.
@@ -160,7 +210,8 @@ class MatResearcherWorkflow:
         async def wrapped(state: WorkflowState) -> dict:
             self._current_node = name
             cache = self._cache
-            if cache is not None and cache.has_node(name):
+            # Nodes on a cycle must never replay a cached patch — see LOOP_NODES.
+            if cache is not None and name not in LOOP_NODES and cache.has_node(name):
                 patch = cache.get_node(name)
                 if patch is not None:
                     console.print(
@@ -176,7 +227,7 @@ class MatResearcherWorkflow:
                     f"  [yellow]⚠ {name}: 缓存文件损坏，重新执行[/yellow]"
                 )
             result = await func(state)
-            if cache is not None:
+            if cache is not None and name not in LOOP_NODES:
                 try:
                     cache.save_node(name, result)
                 except Exception as e:
@@ -217,7 +268,10 @@ class MatResearcherWorkflow:
         console.print(f"Max coverage retries: {self.max_coverage_retries}\n")
 
         try:
-            final_state = await wf.ainvoke(initial_state)
+            final_state = await wf.ainvoke(
+                initial_state,
+                config={"recursion_limit": 150},  # 兜底防御：一旦引入新环可快速失败，而非空转 10007 次
+            )
         except Exception as e:
             # rich_escape: an exception message containing '[' (e.g. MarkupError
             # text, citation markers) must not be parsed as rich markup — that
@@ -251,8 +305,12 @@ class MatResearcherWorkflow:
         if getattr(self, "_token_counter", None) is not None:
             self._print_token_summary()
 
-        # Print report preview
-        report = final_state.get("final_report", final_state.get("draft_report", ""))
+        # Print report preview (submission 模式优先展示参赛方案文档)
+        report = (
+            final_state.get("submission_report")
+            or final_state.get("final_report")
+            or final_state.get("draft_report", "")
+        )
         if report:
             preview = report[:500] + ("..." if len(report) > 500 else "")
             console.print(f"\n[bold green]Report Preview:[/bold green]\n{preview}")
@@ -418,4 +476,8 @@ async def run_survey(question: str, config_path: str | None = None) -> str:
     """
     workflow = MatResearcherWorkflow(config_path)
     result = await workflow.run(question)
-    return result.get("final_report", result.get("draft_report", ""))
+    return (
+        result.get("submission_report")
+        or result.get("final_report")
+        or result.get("draft_report", "")
+    )

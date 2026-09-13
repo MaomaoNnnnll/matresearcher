@@ -27,6 +27,15 @@ class EvidenceVerificationAgent(BaseAgent):
         super().__init__(llm, config, log_dir=log_dir)
         self.sciverse = sciverse
         self.max_verification_rounds = self.config.get("max_verification_rounds", 2)
+        # ── Verification thresholds (configurable, no longer hardcoded) ──
+        # min_match_score       : per-reference passage match score to count as verified
+        # min_verified_coverage : fraction of anchor-bearing refs that must verify
+        #   before the whole Gap is marked "passed".
+        # Old logic required verified == anchor_total (100%), so one weak
+        # reference downgraded an otherwise well-supported Gap to "partial" —
+        # that is why an earlier run reported "0/3 gaps passed".
+        self.pass_score = float(self.config.get("min_match_score", 0.5))
+        self.min_coverage = float(self.config.get("min_verified_coverage", 0.8))
 
     async def run(self, state: WorkflowState) -> dict:
         """This is a dispatch agent — the workflow engine calls specific methods
@@ -225,7 +234,14 @@ class EvidenceVerificationAgent(BaseAgent):
             if corrections:
                 gap.correction_suggestions = corrections
 
-            if verified > 0 and failed == 0 and anchor_total > 0 and verified == anchor_total:
+            # ── Coverage-based judgement (replaces all-or-nothing) ──
+            # A Gap passes when at least `min_verified_coverage` of its
+            # anchor-bearing references verify; the failing refs stay listed in
+            # correction_suggestions so the report can disclose them.
+            coverage = (verified / anchor_total) if anchor_total else 0.0
+            gap.verification_coverage = round(coverage, 3)
+
+            if anchor_total > 0 and coverage >= self.min_coverage:
                 gap.verification_status = "passed"
             elif verified > 0:
                 gap.verification_status = "partial"
@@ -234,7 +250,9 @@ class EvidenceVerificationAgent(BaseAgent):
             # else: anchor_total == 0 → 保持 pending，由下方 unverified 循环接管
 
             gap.verification_notes = (
-                f"Verified: {verified}, Failed: {failed}, Total refs: {total}"
+                f"Verified: {verified}, Failed: {failed}, Total refs: {total}, "
+                f"Anchor refs: {anchor_total}, Coverage: {coverage:.0%} "
+                f"(pass threshold {self.min_coverage:.0%})"
             )
 
         # ── Mark gaps that could not be verified at all (all refs skipped) ──
@@ -298,7 +316,7 @@ class EvidenceVerificationAgent(BaseAgent):
                 passage = result.get("passage", "") or ""
                 reason = result.get("reason", "matched")
 
-                if passage and score > 0.5:
+                if passage and score >= self.pass_score:
                     # Verification result goes into dedicated fields —
                     # ref.finding keeps the original claim text unmodified.
                     ref.verified_passage = passage[:500]
@@ -395,18 +413,41 @@ class EvidenceVerificationAgent(BaseAgent):
             manifest_issues = self._scan_manifest_in_draft(draft)
             issues.extend(manifest_issues)
 
-        # Generate corrections
-        corrections = []
-        for issue in issues:
-            corrections.append(f"[修正建议] {issue}")
+        # ── Closed loop: regenerate instead of merely logging ──
+        # Old behaviour: `final_report = draft + issue log` — the report shipped
+        # with its problems still in the body. Now we ask the graph to send the
+        # draft back to report_generation (bounded by max_revisions) and only
+        # fall back to appending the log when the budget is exhausted.
+        revision = int(state.get("fact_check_revision", 0) or 0) + 1
+        max_revisions = int(self.config.get("max_revisions", 2))
+        needs_revision = bool(issues) and revision <= max_revisions
 
+        corrections = [f"[修正建议] {issue}" for issue in issues]
         final_report = draft
-        if corrections:
+
+        if needs_revision:
+            status = "revising"
+            self.log(
+                f"Found {len(issues)} issue(s) — sending draft back for "
+                f"revision {revision}/{max_revisions}",
+                "yellow",
+            )
+        elif issues:
+            status = "unresolved"
             corrections_section = "\n\n---\n## 事实核查记录 (Fact-Check Log)\n\n"
+            corrections_section += (
+                f"> 已达最大修订轮次 ({max_revisions})，以下问题未能自动修正，"
+                f"请人工复核后再使用该报告。\n\n"
+            )
             corrections_section += "\n".join(f"- {c}" for c in corrections)
             final_report = draft + corrections_section
-            self.log(f"Found {len(issues)} issues requiring attention", "yellow")
+            self.log(
+                f"{len(issues)} issue(s) remain after {max_revisions} revision(s); "
+                f"appended to report for human review",
+                "red",
+            )
         else:
+            status = "revised" if revision > 1 else "clean"
             self.log("All factual claims verified", "green")
 
         return {
@@ -414,6 +455,9 @@ class EvidenceVerificationAgent(BaseAgent):
             "fact_check_checks": checks,
             "fact_check_issues": issues,
             "fact_check_corrections": corrections,
+            "fact_check_revision": revision,
+            "fact_check_status": status,
+            "needs_revision": needs_revision,
         }
 
     async def _llm_fact_check(self, draft: str) -> dict:
@@ -507,7 +551,7 @@ Report to check:
                         f"'{title}' (锚点 {anchor}) 未经证据核验，"
                         f"结论可信度待确认"
                     )
-                elif ref.verification_score <= 0.5:
+                elif ref.verification_score is not None and ref.verification_score < self.pass_score:
                     issues.append(
                         f"核验失败: 缺口 {gap.gap_id} 的支撑文献 "
                         f"'{title}' (锚点 {anchor}) 在 Sciverse 全文库中"

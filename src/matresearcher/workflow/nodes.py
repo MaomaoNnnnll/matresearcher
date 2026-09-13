@@ -1,10 +1,18 @@
-"""LangGraph node wrappers for each agent in the 18-step pipeline.
+"""LangGraph node wrappers for each agent in the MatResearcher pipeline (12 core steps + optional extensions).
 
 Each node function:
 1. Takes the current WorkflowState as input
 2. Invokes the corresponding agent
 3. Returns partial state updates
 4. Logs progress
+
+Two conditional branches:
+  - coverage_check → (retry_search | continue)
+  - fact_check → (revise | done)
+
+Two optional nodes are mounted when enabled in config/workflow.yaml:
+  - structure_property (Step 8.5)
+  - hypothesis_crosscheck (Step 10.5)
 """
 from __future__ import annotations
 
@@ -55,7 +63,7 @@ def create_all_nodes(config: dict[str, Any], run_cache=None) -> dict[str, Callab
 
     llm = LLMClient(
         api_base=llm_cfg.get("api_base") or os.getenv("LLM_API_BASE"),
-        api_key=llm_cfg.get("api_key") or os.getenv("LLM_API_KEY") or os.getenv("MINIMAX_API_KEY") ,
+        api_key=llm_cfg.get("api_key") or os.getenv("LLM_API_KEY"),
         model=llm_cfg.get("model") or os.getenv("LLM_MODEL"),
         temperature=llm_cfg.get("temperature", 0.3),
         # engine.py creates ONE shared TokenCounter BEFORE create_all_nodes and
@@ -94,6 +102,21 @@ def create_all_nodes(config: dict[str, Any], run_cache=None) -> dict[str, Callab
         db_url=config.get("database_url")
         or f"sqlite:///{(PROJECT_ROOT / 'data' / 'matresearcher.db').as_posix()}",
     )
+
+    # Materials Project client (opt-in). Only instantiated when enabled; it is
+    # safe to build regardless of API key (it degrades to the offline path).
+    mp_cfg = config.get("materials_project", {})
+    mp_client = None
+    scibase = None
+    if mp_cfg.get("enabled", False):
+        from ..tools.materials_project import MaterialsProjectClient, SciBaseFallback
+        mp_client = MaterialsProjectClient(
+            api_key=os.getenv("MATERIALS_PROJECT_API_KEY"),
+            api_base=mp_cfg.get("api_base", "https://api.materialsproject.org"),
+            enabled=True,
+        )
+        if mp_cfg.get("scibase_fallback", True):
+            scibase = SciBaseFallback(relational_store)
 
     # Log file output directory (None = file logging disabled)
     log_dir = config.get("log_dir")
@@ -234,6 +257,7 @@ def create_all_nodes(config: dict[str, Any], run_cache=None) -> dict[str, Callab
                     "extra": {
                         "keywords": lit.metadata.keywords,
                         "pdf_url": lit.metadata.pdf_url,
+                        "url": lit.metadata.url,  # resolvable landing URL when DOI is unavailable (title→DOI enrichment fallback)
                         "doc_id": lit.metadata.doc_id,
                         "citation_count": lit.metadata.citation_count,
                         "query_source": lit.metadata.query_source,
@@ -255,6 +279,32 @@ def create_all_nodes(config: dict[str, Any], run_cache=None) -> dict[str, Callab
         _log_step(state, 6, "PDF解析")
         result = await pdf_parsing.run(state)
         _log_step(state, 6, "PDF解析完成")
+
+        # P3-16: persist structurally parsed tables into the relational store so
+        # they are queryable (previously they were only flattened into prose).
+        if relational_store is not None:
+            tables_to_store = []
+            for lit in state.get("filtered_literature", []) or []:
+                parsed = getattr(lit, "parsed_document", None)
+                tables = getattr(parsed, "tables", None) or []
+                doi = getattr(getattr(lit, "metadata", None), "doi", None)
+                for idx, tbl in enumerate(tables):
+                    if not tbl:
+                        continue
+                    tables_to_store.append({
+                        "literature_id": getattr(lit, "id", None),
+                        "doi": doi,
+                        "table_index": idx,
+                        "caption": tbl.get("caption") if isinstance(tbl, dict) else None,
+                        "rows": tbl.get("rows") if isinstance(tbl, dict) else None,
+                    })
+            if tables_to_store:
+                try:
+                    relational_store.add_tables_batch(tables_to_store)
+                    console.print(f"  [cyan]  ↳ 已结构化入库 {len(tables_to_store)} 张表格[/cyan]")
+                except Exception as e:
+                    print(f"[WARNING] Table persistence failed: {e}")
+
         console.print(f"  [bold green]✔ Step 6 完成:[/bold green] PDF解析完成")
         return result
 
@@ -282,6 +332,36 @@ def create_all_nodes(config: dict[str, Any], run_cache=None) -> dict[str, Callab
         n_materials = result.get('fused_table', {}).total_materials if hasattr(result.get('fused_table', {}), 'total_materials') else 0
         _log_step(state, 8, f"知识融合完成: {n_materials} 种材料")
         console.print(f"  [bold green]✔ Step 8 完成:[/bold green] {n_materials} 种材料已融合")
+        return result
+
+    async def node_structure_property(state: WorkflowState) -> dict:
+        """Step 8.5: quantitative structure-property (构效关系) analysis."""
+        from ..rules.structure_property import (
+            analyze_structure_property,
+            format_structure_property_md,
+        )
+        console.print(f"\n  [bold green]▸ Step 8.5:[/bold green] 构效关系定量分析")
+        _log_step(state, "8.5", "构效关系定量分析")
+        records = state.get("normalized_records", []) or []
+        try:
+            report = analyze_structure_property(records)
+            md = format_structure_property_md(report)
+            result: dict[str, Any] = {
+                "structure_property_result": report.to_dict(),
+                "_structure_property_md": md,
+            }
+            n_corr = len(report.correlations)
+            _log_step(state, "8.5", f"构效分析完成: {report.n_records} 条记录, {n_corr} 条显著相关")
+            console.print(f"  [bold green]✔ Step 8.5 完成:[/bold green] {report.n_records} 条记录, {n_corr} 条显著相关")
+        except Exception as e:
+            console.print(f"  [yellow]⚠ 构效分析跳过: {e}[/yellow]")
+            result = {
+                "structure_property_result": {
+                    "n_records": len(records),
+                    "correlations": [],
+                    "warnings": [str(e)],
+                }
+            }
         return result
 
     async def node_gap_generation(state: WorkflowState) -> dict:
@@ -324,12 +404,35 @@ def create_all_nodes(config: dict[str, Any], run_cache=None) -> dict[str, Callab
         _log_step(state, 12, "最终事实核查")
         result = await evidence_verification.fact_check_report(state)
         issues = result.get("fact_check_issues", [])
-        _log_step(state, 12, f"事实核查完成: {len(issues)} 条待确认项")
-        console.print(f"  [bold green]✔ Step 12 完成:[/bold green] {len(issues)} 条待确认项")
+        status = result.get("fact_check_status", "clean")
+        revision = result.get("fact_check_revision", 1)
+        if status == "revising":
+            msg = f"事实核查: {len(issues)} 条待修正 → 第 {revision} 轮重写"
+        elif status == "unresolved":
+            msg = (f"事实核查: {len(issues)} 条未自动修正（已达修订上限），"
+                   f"已附于报告末供人工复核")
+        elif status == "revised":
+            msg = f"事实核查通过（第 {revision} 轮修订后 0 条问题）"
+        else:
+            msg = "事实核查通过: 0 条问题"
+        _log_step(state, 12, msg)
+        console.print(f"  [bold green]✔ Step 12 完成:[/bold green] {msg}")
         return result
 
+    async def node_hypothesis_crosscheck(state: WorkflowState) -> dict:
+        """Step 10.5: cross-check each gap's hypothesis vs MP + Sci-Base."""
+        from ..tools.materials_project import cross_check_gap
+        console.print(f"\n  [bold green]▸ Step 10.5:[/bold green] 假设交叉核验 (MP / Sci-Base)")
+        _log_step(state, "10.5", "假设交叉核验")
+        gaps = state.get("scored_gaps", state.get("gaps", [])) or []
+        results = [cross_check_gap(g, mp_client, scibase) for g in gaps]
+        n_corrob = sum(1 for r in results if r["verdict"] in ("corroborated",))
+        _log_step(state, "10.5", f"假设交叉核验完成: {len(results)} 个假设, {n_corrob} 个命中外部/离线数据")
+        console.print(f"  [bold green]✔ Step 10.5 完成:[/bold green] {len(results)} 个假设, {n_corrob} 个命中")
+        return {"hypothesis_cross_checks": results}
+
     # Return all node functions keyed by node name
-    return {
+    nodes: dict[str, Callable] = {
         "task_planning": node_task_planning,
         "literature_search": node_literature_search,
         "coverage_check": node_coverage_check,
@@ -343,6 +446,25 @@ def create_all_nodes(config: dict[str, Any], run_cache=None) -> dict[str, Callab
         "report_generation": node_report_generation,
         "fact_check": node_fact_check,
     }
+
+    # Optional Step 8.5: quantitative structure-property analysis. Only exposed
+    # as a graph node when enabled in config/workflow.yaml; the engine then wires
+    # knowledge_fusion → structure_property → gap_generation.
+    sp_enabled = (
+        config.get("workflow", {})
+        .get("structure_property_analysis", {})
+        .get("enabled", False)
+    )
+    if sp_enabled:
+        nodes["structure_property"] = node_structure_property
+
+    # Optional Step 10.5: hypothesis cross-check against Materials Project and the
+    # Sci-Base offline corpus. Only exposed when materials_project.enabled is true.
+    mp_enabled = bool(config.get("materials_project", {}).get("enabled", False))
+    if mp_enabled and (mp_client is not None or scibase is not None):
+        nodes["hypothesis_crosscheck"] = node_hypothesis_crosscheck
+
+    return nodes
 
 
 # ─── Global console for step banners ───

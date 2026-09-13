@@ -47,6 +47,34 @@ def _should_retry(exc: BaseException) -> bool:
     the chunk, discarding half the content for no reason."""
     return True
 
+
+# api_base substring → the environment variable holding that provider's key.
+_PROVIDER_KEY_VARS: list[tuple[str, str]] = [
+    ("minimaxi", "MINIMAX_API_KEY"),
+    ("dashscope", "DASHSCOPE_API_KEY"),
+    ("aliyuncs", "DASHSCOPE_API_KEY"),
+    ("deepseek", "DEEPSEEK_API_KEY"),
+    ("moonshot", "MOONSHOT_API_KEY"),
+    ("openai.com", "OPENAI_API_KEY"),
+]
+
+
+def _provider_api_key(api_base: str | None) -> str | None:
+    """Pick the API key belonging to the provider implied by ``api_base``.
+
+    Returns None when no provider-specific variable is set — callers must treat
+    that as "unconfigured" rather than borrowing another provider's key.
+    """
+    base = (api_base or "").lower()
+    for token, env_var in _PROVIDER_KEY_VARS:
+        if token in base:
+            # Prefer the provider-specific key, but fall back to the universal
+            # LLM_API_KEY so a single secret works for any OpenAI-compatible endpoint.
+            return os.getenv(env_var) or os.getenv("LLM_API_KEY")
+    # Unknown/local endpoint (vLLM, Ollama, ...): accept the generic key.
+    return os.getenv("LLM_API_KEY")
+
+
 class LLMClient:
     """Async LLM client with structured output support and local embeddings."""
 
@@ -69,13 +97,31 @@ class LLMClient:
         # legacy DashScope key for backward compatibility with old configs.
         # Without MINIMAX_API_KEY here, parameterless LLMClient() silently
         # authenticated with a stale DASHSCOPE_API_KEY → 401 on api.minimaxi.com.
+        # Provider-aware key resolution. The old chain fell through to
+        # DASHSCOPE_API_KEY regardless of api_base, so a run against
+        # api.minimaxi.com authenticated with a stale DashScope key and failed
+        # with an opaque 401 several minutes in. Now the key must match the
+        # provider implied by api_base (see config_check.py).
         self.api_key = (
             api_key
             or os.getenv("LLM_API_KEY")
-            or os.getenv("MINIMAX_API_KEY")
-            or os.getenv("DASHSCOPE_API_KEY")
+            or _provider_api_key(self.api_base)
         )
-        self.model = model or os.getenv("LLM_MODEL", "qwen3.7-max-preview")
+        self.model = model or os.getenv("LLM_MODEL", "qwen3.7-max-2026-05-17")
+
+        # Fail fast (and loudly) on the misconfigurations that used to surface
+        # as HTTP 401 mid-run.
+        from ..config_check import validate_runtime_config
+
+        for problem in validate_runtime_config(
+            api_base=self.api_base, api_key=self.api_key, model=self.model
+        ):
+            if "missing" in problem or "truncated" in problem:
+                raise RuntimeError(
+                    f"{problem}\n"
+                    f"Resolved target: api_base={self.api_base} model={self.model}"
+                )
+            print(f"[config] WARNING: {problem}")
         self.temperature = temperature
         self._timeout = timeout or self.DEFAULT_TIMEOUT
         self._token_counter = token_counter

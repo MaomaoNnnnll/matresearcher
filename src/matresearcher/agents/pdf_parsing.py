@@ -46,7 +46,9 @@ class PDFParsingAgent(BaseAgent):
         self.mineru = mineru or MinerUParser()
         self.sciverse = sciverse
         self.concurrency = self.config.get("pdf_parse_concurrency", 3)
-        self._unpaywall_email = self.config.get("unpaywall_email", "")
+        # ${UNPAYWALL_EMAIL} 未设置时 _load_config 解析为空串，YAML 会读作 None，
+        # 这里用 or "" 兜底，确保后续判断始终是字符串（None/"" 都会跳过 Unpaywall）。
+        self._unpaywall_email = self.config.get("unpaywall_email") or ""
         self._http_client: httpx.AsyncClient | None = None
 
     async def _get_http_client(self) -> httpx.AsyncClient:

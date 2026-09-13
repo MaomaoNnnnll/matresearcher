@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -23,6 +23,18 @@ console = Console()
 
 # Project root (independent of CWD): F:/projects/matresearcher
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _utcnow() -> datetime:
+    """Timezone-naive UTC timestamp.
+
+    `datetime.utcnow()` is deprecated since Python 3.12 (the project runs on
+    3.13). It is stored naive on purpose: the SQLite DATETIME bind processor
+    does not round-trip tz-aware values, and every existing row was written
+    this way — switching to aware datetimes now would split the column into
+    two incompatible formats.
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 class Base(DeclarativeBase):
@@ -41,7 +53,7 @@ class LiteratureRecord(Base):
     abstract = Column(Text, nullable=True)
     relevance_score = Column(Float, nullable=True)
     verification_status = Column(String, default="pending")
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=_utcnow)
     extra = Column(JSON, nullable=True)  # flexible storage
 
 
@@ -64,7 +76,7 @@ class KnowledgeRecordORM(Base):
     key_findings = Column(Text, nullable=True)
     raw_quotes = Column(JSON, nullable=True)
     quality_status = Column(String, default="pending")
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=_utcnow)
 
 
 class GapRecordORM(Base):
@@ -84,7 +96,7 @@ class GapRecordORM(Base):
     total_score = Column(Float, default=0.0)
     rank = Column(Integer, default=0)
     verification_status = Column(String, default="pending")
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=_utcnow)
 
 
 class AuditLogORM(Base):
@@ -96,8 +108,27 @@ class AuditLogORM(Base):
     action = Column(Text)
     input_summary = Column(Text, nullable=True)
     output_summary = Column(Text, nullable=True)
-    timestamp = Column(DateTime, default=datetime.utcnow)
+    timestamp = Column(DateTime, default=_utcnow)
     extra = Column(JSON, nullable=True)
+
+
+class DataTableORM(Base):
+    """Structured storage for tables parsed from source PDFs (P3-16).
+
+    MinerU returns tables as {"caption": ..., "rows": [[...]]}; previously they
+    were flattened into prose and never persisted as structured data. This table
+    keeps them queryable and traceable back to the source literature.
+    """
+    __tablename__ = "data_tables"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    literature_id = Column(String, index=True, nullable=True)
+    doi = Column(String, index=True, nullable=True)
+    table_index = Column(Integer, default=0)        # order within the document
+    caption = Column(Text, nullable=True)
+    rows_json = Column(JSON, nullable=True)          # list[list[str]]
+    n_rows = Column(Integer, nullable=True)
+    n_cols = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=_utcnow)
 
 
 class RelationalStore:
@@ -131,13 +162,15 @@ class RelationalStore:
         fills in any gaps.
         """
         inspector = inspect(self.engine)
+        dialect = self.engine.dialect
+        quote = dialect.identifier_preparer.quote
 
         # Map: {tablename: {column_name → Column}}
         orm_models = {
             cls.__tablename__: {
                 c.name: c for c in cls.__table__.columns
             }
-            for cls in (LiteratureRecord, KnowledgeRecordORM, GapRecordORM, AuditLogORM)
+            for cls in (LiteratureRecord, KnowledgeRecordORM, GapRecordORM, AuditLogORM, DataTableORM)
         }
 
         for table_name, orm_cols in orm_models.items():
@@ -147,13 +180,33 @@ class RelationalStore:
             for col_name, col in orm_cols.items():
                 if col_name in existing_cols:
                     continue
-                # Determine SQLite type from the Column
-                col_type = str(col.type).upper()
-                nullable = "" if col.nullable else " NOT NULL"
-                default_clause = ""
-                if col.default and col.default.arg is not None:
-                    default_clause = f" DEFAULT {col.default.arg!r}"
-                sql = f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}{nullable}{default_clause}"
+                # Portability: the old code built this DDL with
+                # `str(col.type).upper()` plus a Python repr of the default —
+                # SQLite-only syntax that produced invalid SQL on PostgreSQL
+                # even though the docs claimed "PostgreSQL ready". The type is
+                # now compiled by the active dialect. For production schema
+                # evolution use Alembic; this is a dev convenience path.
+                try:
+                    col_type = col.type.compile(dialect)
+                except Exception:  # noqa: BLE001 - fall back to generic name
+                    col_type = str(col.type)
+
+                sql = (
+                    f"ALTER TABLE {quote(table_name)} "
+                    f"ADD COLUMN {quote(col_name)} {col_type}"
+                )
+                # Defaults are emitted on SQLite only: on other backends adding
+                # NOT NULL without a default is unsafe, and preferring NULL over
+                # aborting startup is the lesser evil here.
+                if dialect.name == "sqlite":
+                    if not col.nullable:
+                        sql += " NOT NULL"
+                    if col.default is not None and getattr(col.default, "arg", None) is not None:
+                        default_val = col.default.arg
+                        if isinstance(default_val, str):
+                            sql += f" DEFAULT '{default_val}'"
+                        else:
+                            sql += f" DEFAULT {default_val!r}"
                 with self.engine.begin() as conn:
                     conn.execute(text(sql))
                 console.print(f"  [yellow]Migrated: added column {table_name}.{col_name}[/yellow]")
@@ -230,3 +283,49 @@ class RelationalStore:
         with Session(self.engine) as session:
             stmt = select(KnowledgeRecordORM.material_composition).distinct()
             return [r for r in session.execute(stmt).scalars() if r]
+
+    def add_table(self, table_data: dict):
+        """Persist one parsed table (P3-16: structured table storage).
+
+        table_data keys: literature_id, doi, table_index, caption, rows (list[list]).
+        """
+        rows = table_data.get("rows") or []
+        with Session(self.engine) as session:
+            record = DataTableORM(
+                literature_id=table_data.get("literature_id"),
+                doi=table_data.get("doi"),
+                table_index=table_data.get("table_index", 0),
+                caption=table_data.get("caption"),
+                rows_json=rows,
+                n_rows=len(rows) if rows else None,
+                n_cols=len(rows[0]) if rows and rows[0] else None,
+            )
+            session.add(record)
+            session.commit()
+
+    def add_tables_batch(self, tables: list[dict]):
+        """Batch-persist parsed tables in a single session."""
+        for t in tables:
+            try:
+                self.add_table(t)
+            except Exception as e:  # noqa: BLE001 - one bad table must not abort the run
+                console.print(f"  [yellow]⚠ 表格存储失败: {e}[/yellow]")
+
+    def get_tables_by_literature(self, literature_id: str) -> list[dict]:
+        """Return all structured tables for a given literature id."""
+        with Session(self.engine) as session:
+            stmt = select(DataTableORM).where(DataTableORM.literature_id == literature_id)
+            rows = session.execute(stmt).scalars().all()
+            return [
+                {
+                    "id": r.id,
+                    "literature_id": r.literature_id,
+                    "doi": r.doi,
+                    "table_index": r.table_index,
+                    "caption": r.caption,
+                    "rows": r.rows_json,
+                    "n_rows": r.n_rows,
+                    "n_cols": r.n_cols,
+                }
+                for r in rows
+            ]
